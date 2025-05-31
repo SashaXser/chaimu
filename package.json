@@ -82,8 +82,5 @@
     "build:min": "bun run ./scripts/build.ts",
     "lint": "bunx oxlint --ignore-path=.oxlintignore && bunx eslint",
     "prepare": "husky"
-  },
-  "dependencies": {
-    "soundtouchjs": "^0.1.30"
   }
 }
