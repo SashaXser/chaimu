@@ -49,7 +49,7 @@ export class BasePlayer {
    * Synchronizes the lipsync of the video and audio elements
    */
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  lipSync(mode: false | string = false) {
+  lipSync(_mode: false | string = false) {
     return this;
   }
 
@@ -102,7 +102,7 @@ export class BasePlayer {
   /**
    * set audio volume in range 0.00 - 1.00
    */
-  set volume(value: number) {
+  set volume(_value: number) {
     return;
   }
 
@@ -117,7 +117,7 @@ export class BasePlayer {
     return 0;
   }
 
-  set playbackRate(value: number) {
+  set playbackRate(_value: number) {
     return;
   }
 
@@ -176,7 +176,7 @@ export class AudioPlayer extends BasePlayer {
   }
 
   audioErrorHandle = (e: DOMException) => {
-    throw new Error("[AudioPlayer]", e);
+    debug.log("[AudioPlayer]", e);
   };
 
   lipSync(mode: false | string = false) {
@@ -224,19 +224,25 @@ export class AudioPlayer extends BasePlayer {
 
   syncPlay() {
     debug.log("[AudioPlayer] sync play called");
-    this.audio.play().catch(this.audioErrorHandle);
+    if (this.audio) {
+      this.audio.play().catch(this.audioErrorHandle);
+    }
     return this;
   }
 
   async play() {
     debug.log("[AudioPlayer] play called");
-    await this.audio.play().catch(this.audioErrorHandle);
+    if (this.audio) {
+      await this.audio.play().catch(this.audioErrorHandle);
+    }
     return this;
   }
 
   async pause(): Promise<this> {
     debug.log("[AudioPlayer] pause called");
-    this.audio.pause();
+    if (this.audio) {
+      this.audio.pause();
+    }
     return this;
   }
 
@@ -295,6 +301,7 @@ export class ChaimuPlayer extends BasePlayer {
 
   private isClearing = false;
   private isInitializing = false;
+  private clearingPromise: Promise<this> | undefined;
 
   async fetchAudio() {
     if (!this._src) {
@@ -313,11 +320,8 @@ export class ChaimuPlayer extends BasePlayer {
       debug.log(`[ChaimuPlayer] Decoding fetched audio...`);
       const data = await res.arrayBuffer();
 
-      // Determine MIME type if available
-      const contentType = res.headers.get("content-type") || undefined;
-
       // Create a Blob from the ArrayBuffer
-      const blob = new Blob([data], contentType ? { type: contentType } : undefined);
+      const blob = new Blob([data]);
 
       // Generate a Blob URL
       tempBlobUrl = URL.createObjectURL(blob);
@@ -384,7 +388,7 @@ export class ChaimuPlayer extends BasePlayer {
       throw new Error("No audio context available");
     }
     if (!this.blobUrl) {
-      throw new Error("No blob URL available. Did you call fetchAudio()?");
+      throw new Error("No blob URL available.");
     }
 
     // Create a hidden <audio> from the Blob URL, do not add to DOM
@@ -451,47 +455,54 @@ export class ChaimuPlayer extends BasePlayer {
     } catch (err) {
       debug.log("[ChaimuPlayer] Failed to close audio context:", err);
     }
+    this.chaimu.audioContext = initAudioContext();
     return this;
   }
 
   async clear() {
-    if (!this.chaimu.audioContext) {
-      throw new Error("No audio context available");
+    if (this.isClearing && this.clearingPromise) {
+      return this.clearingPromise;
     }
 
-    if (this.isClearing) {
-      return this;
+    if (!this.chaimu.audioContext) {
+      throw new Error("No audio context available");
     }
 
     debug.log("clear audio context");
 
     this.isClearing = true;
 
-    try {
-      await this.pause();
+    this.clearingPromise = (async () => {
+      try {
+        await this.pause();
 
-      if (this.audioElement) {
-        this.audioElement.pause();
-        this.audioElement = undefined;
+        if (this.audioElement) {
+          this.audioElement.pause();
+          this.audioElement = undefined;
+        }
+
+        if (this.blobUrl) {
+          URL.revokeObjectURL(this.blobUrl);
+          this.blobUrl = undefined;
+        }
+
+        this.disconnectAudioNodes();
+
+        const oldVolume = this.gainNode ? this.gainNode.gain.value : 1;
+        await this.reopenCtx();
+        if (this.chaimu.audioContext) {
+          this.initAudioBooster();
+          this.volume = oldVolume;
+        }
+
+        return this;
+      } finally {
+        this.isClearing = false;
+        this.clearingPromise = undefined;
       }
+    })();
 
-      if (this.blobUrl) {
-        URL.revokeObjectURL(this.blobUrl);
-        this.blobUrl = undefined;
-      }
-
-      this.disconnectAudioNodes();
-
-      const oldVolume = this.volume;
-      await this.reopenCtx();
-      this.chaimu.audioContext = initAudioContext();
-      this.initAudioBooster();
-      this.volume = oldVolume;
-
-      return this;
-    } finally {
-      this.isClearing = false;
-    }
+    return this.clearingPromise;
   }
 
   async start() {
@@ -503,10 +514,10 @@ export class ChaimuPlayer extends BasePlayer {
       throw new Error("Audio element is missing");
     }
 
-    if (this.isClearing) {
+    if (this.isClearing && this.clearingPromise) {
       // fix sound duplication when activating multiple lipsync (play/playing) in a row
       debug.log("The other cleaner is still running, waiting...");
-      return this;
+      await this.clearingPromise;
     }
 
     debug.log("starting audio via HTMLAudioElement");
@@ -523,7 +534,7 @@ export class ChaimuPlayer extends BasePlayer {
     // Play audio (connected to WebAudio via MediaElementAudioSource)
     this.audioElement
       .play()
-      .catch((err) => debug.log("[ChaimuPlayer] audioElement.play() failed:", err));
+      .catch((err) => debug.log("[ChaimuPlayer] Play audioElement failed:", err));
 
     return this;
   }
@@ -533,12 +544,13 @@ export class ChaimuPlayer extends BasePlayer {
       throw new Error("No audio context available");
     }
 
-    if (this.chaimu.audioContext.state !== "running") {
-      return this;
+    if (this.audioElement) {
+      this.audioElement.pause();
     }
 
-    await this.chaimu.audioContext.suspend();
-    if (this.audioElement) this.audioElement.pause();
+    if (this.chaimu.audioContext.state === "running") {
+      await this.chaimu.audioContext.suspend();
+    }
 
     return this;
   }
